@@ -597,3 +597,75 @@ export async function POST(request: Request) {
     );
   }
 }
+
+
+Update the LDAP authentication utility (lib/ldap.ts):
+
+typescript
+Copy
+export async function authenticateUser(username: string, password: string) {
+  // ... existing code ...
+
+  // Convert group CN values to strings explicitly
+  const groups = searchEntries.map((group) => {
+    if (Array.isArray(group.cn)) {
+      return group.cn.map(cn => cn.toString()).filter(Boolean);
+    }
+    return [group.cn?.toString() || ''].filter(Boolean);
+  }).flat();
+
+  return {
+    username,
+    groups: groups as string[], // Explicit type assertion
+  };
+}
+Update the session type declaration (lib/session.ts):
+
+typescript
+Copy
+declare module 'iron-session' {
+  interface IronSessionData {
+    user?: {
+      username: string;
+      groups: string[]; // Ensure type matches
+    };
+  }
+}
+Verify the login route (app/api/login/route.ts):
+
+typescript
+Copy
+export async function POST(request: Request) {
+  const { username, password } = await request.json();
+  
+  try {
+    const user = await authenticateUser(username, password);
+    const { session, res } = await getSession(request);
+    
+    // Explicit type check
+    if (Array.isArray(user.groups) && user.groups.every(g => typeof g === 'string')) {
+      session.user = {
+        username: user.username,
+        groups: user.groups
+      };
+    } else {
+      throw new Error('Invalid group format from LDAP');
+    }
+    
+    await session.save();
+    
+    return new NextResponse(
+      JSON.stringify({ success: true }), 
+      {
+        status: 200,
+        headers: res.headers
+      }
+    );
+  } catch (error) {
+    console.error('Login error:', error);
+    return NextResponse.json(
+      { error: 'Invalid credentials' },
+      { status: 401 }
+    );
+  }
+}
