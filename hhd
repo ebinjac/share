@@ -1,0 +1,673 @@
+Okay, let's set up LDAP authentication and group-based authorization for your Next.js 15 application using next-auth (now Auth.js), Drizzle, and your existing LDAP configuration.
+
+This solution involves:
+
+Setting up next-auth: Configuring it to use a custom Credentials provider for LDAP authentication.
+LDAP Interaction: Using the ldapjs library to connect to your LDAP server, authenticate users, and fetch their group memberships.
+Session Management: Storing user information (including groups) in the session managed by next-auth.
+Authorization Logic: Checking if the logged-in user's groups include the prcGroup associated with a specific team fetched via Drizzle.
+Protecting Routes/Components: Using next-auth utilities to secure parts of your application.
+Step 1: Install Dependencies
+
+Bash
+
+npm install next-auth@beta # Or the specific version compatible with Next.js 15 App Router
+npm install ldapjs
+npm install @types/ldapjs --save-dev # Types for ldapjs
+Step 2: Configure Environment Variables
+
+Move your LDAP configuration into environment variables for security and flexibility. Create or update your .env.local file:
+
+Code snippet
+
+# Authentication (next-auth)
+AUTH_SECRET="YOUR_STRONG_RANDOM_SECRET" # Generate a strong secret: openssl rand -base64 32
+AUTH_TRUST_HOST=true # For development, review for production
+
+# LDAP Configuration
+LDAP_SERVER_URL="ldap://localhost:636" # Use ldaps:// if using TLS/SSL implicitly
+LDAP_BIND_DN="CN=svc.admin,OU=ServiceAccounts,OU=Process,DC=ads,DC=aexp,DC=com"
+LDAP_BIND_CREDENTIALS="password"
+LDAP_BASE_DN="dc=ads,dc=aexp,dc=com"
+LDAP_USER_SEARCH_BASE="ou=Users,dc=ads,dc=aexp,dc=com" # More specific base for user search
+LDAP_USER_SEARCH_FILTER="(uid={{username}})" # Use {{username}} as placeholder
+LDAP_GROUP_ATTRIBUTE="memberOf" # Attribute on the user object containing group DNs
+
+# Database Connection (ensure these are set for Drizzle)
+# POSTGRES_URL="postgresql://user:password@host:port/database"
+Important:
+
+Replace "YOUR_STRONG_RANDOM_SECRET" with a real secret.
+Adjust LDAP_SERVER_URL to ldaps://localhost:636 if your server requires LDAPS (LDAP over SSL/TLS) on port 636.
+LDAP_USER_SEARCH_BASE is added for efficiency, assuming users are within ou=Users. Adjust if needed.
+The LDAP_USER_SEARCH_FILTER uses {{username}} which we'll replace dynamically.
+Your config snippet used LDAP_GROP = 'memberof', I've used LDAP_GROUP_ATTRIBUTE="memberOf". Ensure this attribute (memberOf) actually exists on your user entries and contains the DNs of the groups they belong to. This is common in Active Directory but might need configuration in OpenLDAP (e.g., using overlays).
+Step 3: Setup next-auth Configuration
+
+Create the following files:
+
+auth.config.ts (Defines providers and pages, separate for Edge compatibility if needed)
+
+TypeScript
+
+import type { NextAuthConfig } from 'next-auth';
+import Credentials from 'next-auth/providers/credentials';
+import { authenticateLdap } from '@/lib/ldap'; // We will create this function
+
+export const authConfig = {
+  pages: {
+    signIn: '/login', // Redirect users to /login if unauthenticated
+  },
+  providers: [
+    Credentials({
+      name: 'LDAP',
+      credentials: {
+        username: { label: 'Username', type: 'text', placeholder: 'user1' },
+        password: { label: 'Password', type: 'password' },
+      },
+      async authorize(credentials) {
+        if (!credentials?.username || !credentials?.password) {
+          return null;
+        }
+
+        try {
+          // Call your LDAP authentication function
+          const user = await authenticateLdap(
+            credentials.username as string,
+            credentials.password as string
+          );
+
+          // If authentication is successful, user object is returned
+          // If not, authenticateLdap should throw an error or return null
+          if (user) {
+            // The user object MUST contain at least id, name, email
+            // We also include groups for authorization
+            return {
+              id: user.uid,
+              name: user.cn,
+              email: user.mail, // Assuming mail attribute exists
+              groups: user.groups, // Array of group common names (CNs)
+            };
+          }
+          return null; // Authentication failed
+        } catch (error) {
+          console.error('LDAP Authentication Error:', error);
+          // You might want to throw a specific error type recognised by next-auth
+          // or return null to indicate failure generically.
+          return null;
+        }
+      },
+    }),
+    // Add other providers here if needed (e.g., Google, GitHub)
+  ],
+  callbacks: {
+    // Use JWT strategy
+    async jwt({ token, user, account }) {
+      // Persist the user's groups onto the JWT token when signing in
+      if (account && user) {
+        token.id = user.id; // Persist uid
+        token.groups = (user as any).groups; // Cast needed as default User type doesn't have groups
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      // Send properties to the client (browser), like user's groups
+      if (token && session.user) {
+        session.user.id = token.id as string; // Add uid to session
+        session.user.groups = token.groups as string[]; // Add groups to session
+      }
+      return session;
+    },
+    authorized({ auth, request: { nextUrl } }) {
+      const isLoggedIn = !!auth?.user;
+      const isOnLoginPage = nextUrl.pathname.startsWith('/login');
+      const isApiAuthRoute = nextUrl.pathname.startsWith('/api/auth'); // next-auth's own routes
+
+      if (isApiAuthRoute) {
+         // Allow access to next-auth's API routes
+        return true;
+      }
+
+      if (isOnLoginPage) {
+        if (isLoggedIn) {
+          // Redirect logged-in users away from login page
+          return Response.redirect(new URL('/', nextUrl));
+        }
+        return true; // Allow access to login page if not logged in
+      }
+
+      // Protect all other routes - require login
+      return isLoggedIn;
+    },
+  },
+  // trustHost: true, // Already set via env var AUTH_TRUST_HOST
+  // secret: process.env.AUTH_SECRET, // Automatically picked up if AUTH_SECRET is set
+} satisfies NextAuthConfig;
+auth.ts (Main NextAuth export, integrating the config)
+
+TypeScript
+
+import NextAuth from 'next-auth';
+import { authConfig } from './auth.config';
+
+export const {
+  handlers: { GET, POST }, // Route handlers for /api/auth/*
+  auth,                 // Server-side session access (Server Components, Actions, Route Handlers)
+  signIn,               // Function to trigger login
+  signOut,              // Function to trigger logout
+} = NextAuth(authConfig);
+middleware.ts (In the root of your project or /src)
+
+TypeScript
+
+import NextAuth from 'next-auth';
+import { authConfig } from './auth.config'; // Adjust path if necessary
+
+// Use the authorized callback from authConfig to handle redirects
+export default NextAuth(authConfig).auth;
+
+// Define which routes should be protected by the middleware
+export const config = {
+  // Matcher excluding static files, images, and next-auth API routes
+  matcher: ['/((?!api/auth|_next/static|_next/image|favicon.ico).*)'],
+};
+types/next-auth.d.ts (To extend the default Session/User/JWT types)
+
+TypeScript
+
+import type { DefaultSession, User } from 'next-auth';
+import type { JWT } from 'next-auth/jwt';
+
+declare module 'next-auth' {
+  /**
+   * Returned by `useSession`, `getSession` and received as a prop on the `SessionProvider` React Context
+   */
+  interface Session {
+    user: {
+      id?: string | null; // Add the id property
+      groups?: string[]; // Add the groups property
+    } & DefaultSession['user']; // Keep existing properties like name, email, image
+  }
+
+  // Potentially extend User if needed, though we transform it in authorize
+  // interface User {
+  //   groups?: string[];
+  // }
+}
+
+declare module 'next-auth/jwt' {
+  /** Returned by the `jwt` callback and `getToken`, when using JWT sessions */
+  interface JWT {
+    id?: string; // Add id to the token
+    groups?: string[]; // Add groups to the token
+  }
+}
+Step 4: Implement LDAP Authentication Logic
+
+Create the file lib/ldap.ts:
+
+TypeScript
+
+import ldap from 'ldapjs';
+
+interface LdapUser {
+  dn: string;
+  uid: string;
+  cn: string;
+  mail?: string;
+  groups: string[]; // Store group Common Names (CNs)
+}
+
+// Helper to extract CN from a DN string (e.g., "cn=Admins,ou=Groups,dc=..." -> "Admins")
+function getCnFromDn(dn: string): string | null {
+  const match = dn.match(/cn=([^,]+)/i);
+  return match ? match[1] : null;
+}
+
+export async function authenticateLdap(username: string, password: string): Promise<LdapUser | null> {
+  const ldapUrl = process.env.LDAP_SERVER_URL!;
+  const bindDn = process.env.LDAP_BIND_DN!;
+  const bindCredentials = process.env.LDAP_BIND_CREDENTIALS!;
+  const searchBase = process.env.LDAP_USER_SEARCH_BASE || process.env.LDAP_BASE_DN!;
+  let searchFilter = process.env.LDAP_USER_SEARCH_FILTER || '(uid={{username}})';
+  const groupAttribute = process.env.LDAP_GROUP_ATTRIBUTE || 'memberOf';
+
+  // Replace placeholder in filter
+  searchFilter = searchFilter.replace('{{username}}', ldap.escapeFilter(username));
+
+  // --- IMPORTANT: LDAPS Certificate Handling ---
+  // For production, configure proper CA certs.
+  // For development with self-signed certs, you might need to disable rejection.
+  // **NEVER use rejectUnauthorized: false in Production!**
+  const tlsOptions: ldap.TlsOptions = {};
+  if (ldapUrl.startsWith('ldaps') && process.env.NODE_ENV === 'development') {
+      console.warn('LDAP: Using rejectUnauthorized: false for LDAPS in development. DO NOT use in production without proper CA setup.');
+      tlsOptions.rejectUnauthorized = false;
+  }
+  // You might need to provide ca, cert, key paths in tlsOptions for production
+  // tlsOptions: {
+  //   ca: [fs.readFileSync('/path/to/ca.crt')],
+  //   // key: fs.readFileSync('/path/to/client-key.pem'), // If client cert auth is needed
+  //   // cert: fs.readFileSync('/path/to/client-cert.pem'), // If client cert auth is needed
+  // }
+  // ---
+
+  const client = ldap.createClient({
+    url: [ldapUrl], // url expects an array
+    tlsOptions: tlsOptions,
+    connectTimeout: 5000, // 5 seconds timeout
+  });
+
+  // Promisify LDAP operations for async/await usage
+  const bindAsync = (dn: string, creds: string) => new Promise<void>((resolve, reject) => {
+    client.bind(dn, creds, (err) => {
+      if (err) {
+        console.error(`LDAP Bind Error for DN [${dn}]:`, err.message);
+        reject(err);
+      } else {
+        console.log(`LDAP Bind successful for DN [${dn}]`);
+        resolve();
+      }
+    });
+  });
+
+  const searchAsync = (base: string, opts: ldap.SearchOptions) => new Promise<ldap.SearchEntryObject[]>((resolve, reject) => {
+    const entries: ldap.SearchEntryObject[] = [];
+    client.search(base, opts, (err, res) => {
+      if (err) {
+        console.error('LDAP Search Initiation Error:', err.message);
+        return reject(err);
+      }
+      res.on('searchEntry', (entry) => {
+        entries.push(entry.object);
+      });
+      res.on('error', (err) => {
+        console.error('LDAP Search Stream Error:', err.message);
+        // Don't reject here if end has already been called
+        if (err.message !== 'Connection closed') {
+           reject(err);
+        }
+      });
+      res.on('end', (result) => {
+        if (result?.status !== 0) {
+           console.error('LDAP Search End Error Status:', result?.status, result?.errorMessage);
+           // Avoid rejecting if entries were found but status is non-zero (might happen in some cases)
+           // if (entries.length === 0) {
+           //    reject(new Error(`LDAP search failed with status: ${result?.status} ${result?.errorMessage}`));
+           // } else {
+           //   resolve(entries); // Resolve with what we found if needed
+           // }
+            if (!entries.length) { // Only reject if no entries found AND error status
+                 reject(new Error(`LDAP search failed: ${result?.errorMessage} (Status: ${result?.status})`));
+            } else {
+                 console.warn(`LDAP search ended with status ${result?.status} but entries were found.`);
+                 resolve(entries);
+            }
+
+        } else {
+          resolve(entries);
+        }
+      });
+    });
+  });
+
+  const unbindAsync = () => new Promise<void>((resolve, reject) => {
+    client.unbind(err => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+
+  try {
+    // 1. Bind with the service account to search for the user
+    await bindAsync(bindDn, bindCredentials);
+    console.log(`LDAP: Service account bind successful.`);
+
+    // 2. Search for the user based on the provided username (uid)
+    const searchOptions: ldap.SearchOptions = {
+      filter: searchFilter,
+      scope: 'sub', // Search subtree
+      attributes: ['dn', 'uid', 'cn', 'sn', 'mail', groupAttribute], // Attributes to retrieve
+      sizeLimit: 1 // Expect only one user
+    };
+
+    console.log(`LDAP: Searching for user with filter "${searchFilter}" under base "${searchBase}"`);
+    const users = await searchAsync(searchBase, searchOptions);
+
+    if (users.length === 0) {
+      console.log(`LDAP: User "${username}" not found.`);
+      throw new Error('User not found');
+    }
+    if (users.length > 1) {
+      console.warn(`LDAP: Multiple users found for filter "${searchFilter}". Using the first one.`);
+      // Potentially throw an error here depending on desired behaviour
+    }
+
+    const userEntry = users[0];
+    const userDn = userEntry.dn; // Get the user's full DN
+    console.log(`LDAP: Found user DN: ${userDn}`);
+
+    // (Optional) Unbind service account if needed before binding as user
+    // Some servers might allow re-binding without unbind
+    // await unbindAsync();
+
+    // 3. Attempt to bind as the found user with their provided password to verify credentials
+    console.log(`LDAP: Attempting bind as user "${userDn}" to verify password...`);
+    await bindAsync(userDn, password);
+    console.log(`LDAP: User "${username}" authenticated successfully.`);
+
+    // 4. Extract group information (we already fetched it in the search)
+    let groupDns: string[] = [];
+    const memberOfAttr = userEntry[groupAttribute];
+    if (memberOfAttr) {
+      groupDns = Array.isArray(memberOfAttr) ? memberOfAttr : [memberOfAttr];
+    }
+    console.log(`LDAP: Raw Group DNs for user "${username}":`, groupDns);
+
+    // Extract Common Names (CN) from group DNs for easier comparison
+    const groupCns = groupDns.map(dn => getCnFromDn(dn)).filter((cn): cn is string => cn !== null);
+    console.log(`LDAP: Extracted Group CNs for user "${username}":`, groupCns);
+
+    // 5. Construct the user object for next-auth
+    const finalUser: LdapUser = {
+      dn: userDn,
+      uid: userEntry.uid,
+      cn: userEntry.cn || userEntry.uid, // Fallback to uid if cn is missing
+      mail: userEntry.mail,
+      groups: groupCns, // Use the extracted CNs
+    };
+
+    return finalUser;
+
+  } catch (error: any) {
+    console.error('LDAP Authentication Process Failed:', error.message);
+    // Ensure specific errors like invalid credentials are handled
+    if (error.name === 'InvalidCredentialsError' || (error.lde_message && error.lde_message.includes('Invalid Credentials'))) {
+        console.log(`LDAP: Invalid credentials provided for user "${username}".`);
+        return null; // Signal failed authentication due to bad password
+    }
+     if (error.message === 'User not found') {
+       return null; // Signal failed authentication due to user not existing
+    }
+    // For other errors (connection, search error, etc.), re-throw or return null
+    // Depending on how you want to surface errors to the user
+    throw error; // Re-throw other errors to be caught by `authorize`
+  } finally {
+    // 6. Always unbind the client
+    if (client) {
+       console.log("LDAP: Unbinding client.");
+      await unbindAsync().catch(e => console.error("LDAP unbind error:", e.message));
+    }
+  }
+}
+Step 5: Create Login Page
+
+Create app/login/page.tsx:
+
+TypeScript
+
+'use client'; // Required for using hooks and event handlers
+
+import { useState } from 'react';
+import { signIn } from 'next-auth/react'; // Use client-side signIn
+import { useRouter, useSearchParams } from 'next/navigation';
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Terminal } from 'lucide-react';
+
+
+export default function LoginPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const callbackUrl = searchParams.get('callbackUrl') || '/'; // Redirect after login
+  const error = searchParams.get('error'); // Get error from URL query params (next-auth redirect)
+
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null); // For immediate feedback
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setLoading(true);
+    setLocalError(null); // Clear previous errors
+
+    try {
+      const result = await signIn('credentials', {
+        redirect: false, // Handle redirect manually after checking result
+        username: username,
+        password: password,
+        callbackUrl: callbackUrl,
+      });
+
+      if (result?.error) {
+        console.error("Sign-in error:", result.error);
+        // Map common errors to user-friendly messages
+        if (result.error === 'CredentialsSignin') {
+           setLocalError('Invalid username or password.');
+        } else if (result.error === 'Callback') {
+            // This can happen if the authorize function throws an unhandled error
+            setLocalError('An unexpected error occurred during login. Please try again.');
+        }
+         else {
+           setLocalError(`Login failed: ${result.error}`);
+        }
+      } else if (result?.ok && result.url) {
+        // Sign-in successful, redirect using router
+        router.push(result.url);
+        // No need to setLoading(false) as we are navigating away
+        return;
+      } else {
+          // Handle unexpected non-error case where signin doesn't redirect or error
+          setLocalError('Login failed. Please try again.');
+      }
+    } catch (error) {
+      console.error('Login submission error:', error);
+      setLocalError('An unexpected error occurred. Please check the console.');
+    }
+
+    setLoading(false);
+  };
+
+   // Display error message passed by next-auth redirect or local errors
+   const displayError = error === 'CredentialsSignin' ? 'Invalid username or password.' : localError;
+
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-gray-100">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="text-2xl">Login</CardTitle>
+          <CardDescription>
+            Enter your LDAP username and password below to login.
+          </CardDescription>
+        </CardHeader>
+        <form onSubmit={handleSubmit}>
+          <CardContent className="grid gap-4">
+            {displayError && (
+               <Alert variant="destructive">
+                 <Terminal className="h-4 w-4" />
+                 <AlertTitle>Login Error</AlertTitle>
+                 <AlertDescription>
+                    {displayError}
+                 </AlertDescription>
+               </Alert>
+            )}
+            <div className="grid gap-2">
+              <Label htmlFor="username">Username</Label>
+              <Input
+                id="username"
+                type="text"
+                placeholder="Your LDAP UID"
+                required
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                disabled={loading}
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="password">Password</Label>
+              <Input
+                id="password"
+                type="password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={loading}
+              />
+            </div>
+          </CardContent>
+          <CardFooter>
+            <Button type="submit" className="w-full" disabled={loading}>
+              {loading ? 'Signing in...' : 'Sign in'}
+            </Button>
+          </CardFooter>
+        </form>
+      </Card>
+    </div>
+  );
+}
+
+Step 6: Implement Authorization Check
+
+Now, let's use the user's groups stored in the session to authorize access based on the prcGroup in your teamsTable.
+
+Fetch Team Data (using Drizzle): Assume you have a Drizzle setup and a function to get team details.
+
+TypeScript
+
+// Example: lib/db/teams.ts (adjust based on your structure)
+import { db } from '@/lib/db/index'; // Your drizzle instance
+import { teamsTable } from '@/lib/db/schema'; // Your teams table schema
+import { eq } from 'drizzle-orm';
+
+export async function getTeamById(teamId: string) {
+  try {
+    const team = await db.query.teamsTable.findFirst({
+      where: eq(teamsTable.id, teamId),
+    });
+    return team;
+  } catch (error) {
+    console.error("Error fetching team:", error);
+    return null;
+  }
+}
+Perform Authorization Check: You can do this in Server Components, Server Actions, or API Routes where you need to protect team-specific data or actions.
+
+Example: Server Component for a Team Page (app/teams/[teamId]/page.tsx)
+
+TypeScript
+
+import { auth } from '@/auth'; // Get server-side session
+import { getTeamById } from '@/lib/db/teams';
+import { teamsTable } from '@/lib/db/schema'; // Import schema type if needed
+import { notFound, redirect } from 'next/navigation';
+import { Button } from '@/components/ui/button';
+import { signOut } from '@/auth'; // Import server-side signOut if needed for actions
+
+// Example type for team data (optional but good practice)
+type Team = typeof teamsTable.$inferSelect;
+
+// Authorization check function (can be reused)
+function canAccessTeam(team: Team | null | undefined, userGroups: string[] | undefined): boolean {
+    if (!team || !team.prcGroup || !userGroups) {
+        return false; // Cannot authorize if team, prcGroup or user groups are missing
+    }
+    // Check if any of the user's groups match the team's prcGroup
+    return userGroups.includes(team.prcGroup);
+}
+
+
+export default async function TeamPage({ params }: { params: { teamId: string } }) {
+  const session = await auth(); // Get session info on the server
+
+  if (!session?.user) {
+     // Should be handled by middleware, but good as a safeguard
+     redirect('/login');
+  }
+
+  // Fetch team data using Drizzle
+  const team = await getTeamById(params.teamId);
+
+  if (!team) {
+    notFound(); // Or show a "Team not found" message
+  }
+
+  // --- AUTHORIZATION CHECK ---
+  const userGroups = session.user.groups; // Groups from the session/token
+  const hasAccess = canAccessTeam(team, userGroups);
+
+  if (!hasAccess) {
+    // User is logged in but not authorized for THIS team
+    return (
+      <div className="p-4">
+        <h1 className="text-2xl font-bold text-red-600">Access Denied</h1>
+        <p>You do not have the required permissions (Group: {team?.prcGroup}) to view this team.</p>
+        <p>Your groups: {userGroups?.join(', ') || 'None'}</p>
+        {/* Optionally add a sign out button or link back home */}
+         <form action={async () => {
+            'use server';
+            await signOut({ redirectTo: '/' });
+         }}>
+             <Button variant="outline" className="mt-4">Sign Out</Button>
+         </form>
+      </div>
+    );
+  }
+
+  // --- User is Authorized ---
+  // Render the team details
+  return (
+    <div className="p-4">
+      <h1 className="text-2xl font-bold">Team Details: {team.teamName}</h1>
+      <p>ID: {team.id}</p>
+      <p>PRC Group Required: {team.prcGroup}</p>
+      <p>Escalation: {team.escalation}</p>
+      {/* Add other team details */}
+
+      {/* Example Logout Button */}
+      <form action={async () => {
+          'use server';
+          await signOut({ redirectTo: '/' });
+      }}>
+          <Button variant="destructive" className="mt-4">Sign Out</Button>
+      </form>
+    </div>
+  );
+}
+Step 7: Add Sign Out Functionality
+
+You can add a sign-out button anywhere you have access to the signOut function.
+
+Example: Simple Sign Out Button Component
+
+TypeScript
+
+// components/SignOutButton.tsx
+'use client'; // If used in a client component context
+
+import { signOut } from "next-auth/react"; // Use client-side signOut for simple buttons
+import { Button } from "@/components/ui/button";
+
+export function SignOutButton() {
+  return (
+    <Button onClick={() => signOut({ callbackUrl: '/login' })} variant="outline">
+      Sign Out
+    </Button>
+  );
+}
+
+// OR if used within a Server Component with Server Actions:
+// See the example in TeamPage above using <form> and server-side signOut
+Summary & Key Points:
+
+LDAP Connection: ldapjs connects to your LDAP server. Ensure LDAP_SERVER_URL is correct (ldap:// vs ldaps://) and handle TLS/SSL certificates properly, especially for production.
+Authentication Flow: The Credentials provider in next-auth uses your authenticateLdap function. This function searches for the user, verifies their password by binding as them, and fetches their group memberships (memberOf attribute).
+Session: next-auth manages the user's session via JWTs. The user's LDAP uid and group Common Names (CNs) are stored in the JWT and session object.
+Authorization: Server-side components/actions (auth()) or client-side components (useSession()) access the user's groups from the session. This list of groups is compared against the prcGroup field fetched from your teamsTable using Drizzle to determine access.
+Protection: Middleware (middleware.ts) enforces authentication for specified routes. Page/component logic enforces authorization based on group membership.
+Error Handling: Basic error handling is included in the login form and LDAP function. Enhance this as needed for specific LDAP error codes or user feedback.
+Environment Variables: Keep all sensitive credentials and configuration outside your codebase.
