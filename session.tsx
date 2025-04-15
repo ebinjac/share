@@ -669,3 +669,172 @@ export async function POST(request: Request) {
     );
   }
 }
+Install Required Dependencies
+
+bash
+Copy
+npm install ldapts iron-session drizzle-orm @types/cookie
+Configure LDAP Utility (lib/ldap.ts)
+
+typescript
+Copy
+import { Client } from 'ldapts';
+
+const LDAP_CONFIG = {
+  URL: process.env.LDAP_SERVER_URL || 'ldaps://localhost:636',
+  BIND_DN: process.env.LDAP_BIND_DN || 'CN=svc.admin,OU=ServiceAccounts,OU=Process,DC=ads,DC=aexp,DC=com',
+  BIND_CREDENTIALS: process.env.LDAP_BIND_CREDENTIALS || 'password',
+  BASE_DN: process.env.LDAP_BASE_DN || 'dc=ads,dc=aexp,dc=com',
+};
+
+export async function authenticateUser(username: string, password: string) {
+  const client = new Client({
+    url: LDAP_CONFIG.URL,
+    tlsOptions: { rejectUnauthorized: false },
+  });
+
+  try {
+    // Bind with service account
+    await client.bind(LDAP_CONFIG.BIND_DN, LDAP_CONFIG.BIND_CREDENTIALS);
+
+    // Search for user
+    const { searchEntries } = await client.search(LDAP_CONFIG.BASE_DN, {
+      scope: 'sub',
+      filter: `(uid=${username})`,
+    });
+
+    if (!searchEntries.length) throw new Error('User not found');
+    const userDN = searchEntries[0].dn;
+
+    // Verify user credentials
+    await client.bind(userDN, password);
+
+    // Get user groups
+    const { searchEntries: groups } = await client.search('ou=Groups,dc=ads,dc=aexp,dc=com', {
+      scope: 'sub',
+      filter: `(member=${userDN})`,
+      attributes: ['cn'],
+    });
+
+    return {
+      username,
+      groups: groups.map((g) => g.cn),
+    };
+  } finally {
+    await client.unbind();
+  }
+}
+Configure Session Management (lib/session.ts)
+
+typescript
+Copy
+import { getIronSession, createResponse } from 'iron-session';
+
+declare module 'iron-session' {
+  interface IronSessionData {
+    user?: {
+      username: string;
+      groups: string[];
+    };
+  }
+}
+
+const sessionOptions = {
+  password: process.env.SESSION_SECRET!,
+  cookieName: 'ldap-auth',
+  cookieOptions: {
+    secure: process.env.NODE_ENV === 'production',
+  },
+};
+
+export async function getSession(req: Request, res: Response) {
+  return getIronSession(req, res, sessionOptions);
+}
+Create Login API Route (app/api/login/route.ts)
+
+typescript
+Copy
+import { NextResponse } from 'next/server';
+import { authenticateUser } from '@/lib/ldap';
+import { getSession } from '@/lib/session';
+
+export async function POST(request: Request) {
+  const { username, password } = await request.json();
+  
+  try {
+    const user = await authenticateUser(username, password);
+    const session = await getSession(request);
+    
+    session.user = user;
+    await session.save();
+    
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json(
+      { error: 'Invalid credentials' },
+      { status: 401 }
+    );
+  }
+}
+Create Authorization Middleware (middleware.ts)
+
+typescript
+Copy
+import { NextResponse } from 'next/server';
+import { getSession } from './lib/session';
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { teamsTable } from './db/schema';
+
+export async function middleware(request: NextRequest) {
+  const session = await getSession(request);
+  const path = request.nextUrl.pathname;
+
+  // Protect team routes
+  if (path.startsWith('/teams/')) {
+    if (!session.user) {
+      return NextResponse.redirect(new URL('/login', request.url));
+    }
+
+    const teamId = path.split('/')[2];
+    const team = await db.select()
+      .from(teamsTable)
+      .where(eq(teamsTable.id, teamId))
+      .get();
+
+    if (!team) return NextResponse.next();
+
+    if (!session.user.groups.includes(team.prcGroup)) {
+      return NextResponse.redirect(new URL('/unauthorized', request.url));
+    }
+  }
+
+  return NextResponse.next();
+}
+Create Team Page with Authorization (app/teams/[id]/page.tsx)
+
+typescript
+Copy
+import { db } from '@/db';
+import { eq } from 'drizzle-orm';
+import { teamsTable } from '@/db/schema';
+import { getSession } from '@/lib/session';
+
+export default async function TeamPage({ params }: { params: { id: string } }) {
+  const session = await getSession();
+  const team = await db.select()
+    .from(teamsTable)
+    .where(eq(teamsTable.id, params.id))
+    .get();
+
+  if (!team) return <div>Team not found</div>;
+  
+  return (
+    <div>
+      <h1>{team.teamName}</h1>
+      {/* Team details */}
+    </div>
+  );
+}
+Add Environment Variables (.env.local)
+
