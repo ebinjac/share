@@ -528,3 +528,72 @@ export default function ProtectedPage() {
     </div>
   );
 }
+
+
+Update session.ts (fix type declarations and parameters):
+
+typescript
+Copy
+// lib/session.ts
+import { getIronSession, IronSessionData } from 'iron-session';
+
+declare module 'iron-session' {
+  interface IronSessionData {
+    user?: {
+      username: string;
+      groups: string[];
+    };
+  }
+}
+
+const sessionOptions = {
+  password: process.env.SESSION_SECRET!,
+  cookieName: 'ldap-auth',
+  cookieOptions: {
+    secure: process.env.NODE_ENV === 'production',
+  },
+};
+
+export async function getSession(req: Request) {
+  const res = new Response();
+  const session = await getIronSession<IronSessionData>(req, res, sessionOptions);
+  return { session, res };
+}
+
+export type Session = Awaited<ReturnType<typeof getSession>>['session'];
+Fix login route implementation (app/api/login/route.ts):
+
+typescript
+Copy
+import { NextResponse } from 'next/server';
+import { authenticateUser } from '@/lib/ldap';
+import { getSession } from '@/lib/session';
+
+export async function POST(request: Request) {
+  const { username, password } = await request.json();
+  
+  try {
+    const user = await authenticateUser(username, password);
+    const { session, res } = await getSession(request);
+    
+    session.user = {
+      username: user.username,
+      groups: user.groups
+    };
+    
+    await session.save();
+    
+    return new NextResponse(
+      JSON.stringify({ success: true }), 
+      {
+        status: 200,
+        headers: res.headers
+      }
+    );
+  } catch (error) {
+    return NextResponse.json(
+      { error: 'Invalid credentials' },
+      { status: 401 }
+    );
+  }
+}
